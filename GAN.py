@@ -1,217 +1,95 @@
-from PIL import Image
-import os
-
-import tensorflow as tf
-from tensorflow import keras
-
-from tensorflow.keras.optimizers import Adam
-
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import Dense, LeakyReLU, BatchNormalization, Conv2D
-from tensorflow.keras.layers import Reshape, Flatten, Input, Activation, Conv2DTranspose
-
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-
-import numpy as np
-import re
-import matplotlib.pyplot as plt
-
-from tqdm import tqdm
-import cv2
-
+import jax
+import jax.numpy as jnp
+import flax
+import flax.linen as nn
 from icecream import ic
+from tqdm import tqdm
 
-class DCGAN(keras.Model):
-    def __init__(self):
-        super(DCGAN, self).__init__()
-        self.img_rows = 64
-        self.img_cols = 64
-        self.channels = 3
-        self.img_shape = (self.img_rows, self.img_cols, self.channels)
-        
-        self.generator = self.build_generator()
-        self.discriminator = self.build_discriminator()
-        
-        self.gan = Sequential()
-        
-        self.gan.add(self.generator)
-        self.gan.add(self.discriminator)
-        
-    def compile(self, d_optimizer, g_optimizer, loss_fn):
-        super(DCGAN, self).compile()
-        self.d_optimizer = d_optimizer
-        self.g_optimizer = g_optimizer
-        self.loss_fn = loss_fn
-        self.d_loss_metric = tf.keras.metrics.Mean()
-        self.g_loss_metric = tf.keras.metrics.Mean()
+import wandb
 
-    def build_generator(self) -> Model:        
-        model = Sequential(name='generator')
-        
-        model.add(Dense(
-            units = 4 * 4 * 512,
-            kernel_initializer = 'glorot_uniform',
-            input_shape = (1, 1, 100))
-        )
-        model.add(Reshape(target_shape=(4, 4, 512)))
-        model.add(BatchNormalization(momentum=0.5))
-        model.add(Activation('relu'))
-        
-        model.add(Conv2DTranspose(
-            filters = 256, kernel_size = (5,5),
-            strides = (2, 2), padding = 'same',
-            data_format = 'channels_last',
-            kernel_initializer='glorot_uniform'
-        ))
-        model.add(BatchNormalization(momentum=0.5))
-        model.add(Activation('relu'))
-        
-        model.add(Conv2DTranspose(
-            filters = 128, kernel_size = (5,5),
-            strides = (2, 2), padding = 'same',
-            data_format = 'channels_last',
-            kernel_initializer='glorot_uniform'
-        ))
-        model.add(BatchNormalization(momentum=0.5))
-        model.add(Activation('relu'))
-        
-        model.add(Conv2DTranspose(
-            filters = 64, kernel_size = (5,5),
-            strides = (2, 2), padding = 'same',
-            data_format = 'channels_last',
-            kernel_initializer='glorot_uniform'
-        ))
-        model.add(BatchNormalization(momentum=0.5))
-        model.add(Activation('relu'))
-        
-        model.add(Conv2DTranspose(
-            filters = 3, kernel_size = (5,5),
-            strides = (2, 2), padding = 'same',
-            data_format = 'channels_last',
-            kernel_initializer='glorot_uniform'
-        ))
-        model.add(Activation('tanh'))
-        
-        return model
-    
-    def build_discriminator(self) -> Model:
-        img_shape = (self.img_rows, self.img_cols, self.channels)
-        
-        model = Sequential(name='discriminator')
-        
-        model.add(Conv2D(filters=64, kernel_size=(5, 5),
-                        strides = (2, 2), padding = 'same',
-                        data_format = 'channels_last',
-                        kernel_initializer = 'glorot_uniform',
-                        input_shape = img_shape))
-        model.add(BatchNormalization(momentum=0.5))
-        model.add(LeakyReLU(0.2))
-        
-        model.add(Conv2D(filters=128, kernel_size=(5, 5),
-                        strides = (2, 2), padding = 'same',
-                        data_format = 'channels_last',
-                        kernel_initializer = 'glorot_uniform'))
-        model.add(BatchNormalization(momentum=0.5))
-        model.add(LeakyReLU(0.2))
-        
-        model.add(Conv2D(filters=256, kernel_size=(5, 5),
-                        strides = (2, 2), padding = 'same',
-                        data_format = 'channels_last',
-                        kernel_initializer = 'glorot_uniform'))
-        model.add(BatchNormalization(momentum=0.5))
-        model.add(LeakyReLU(0.2))
-        
-        model.add(Conv2D(filters=512, kernel_size=(5, 5),
-                        strides = (2, 2), padding = 'same',
-                        data_format = 'channels_last',
-                        kernel_initializer = 'glorot_uniform'))
-        model.add(BatchNormalization(momentum=0.5))
-        model.add(LeakyReLU(0.2))
-        
-        model.add(Flatten())
-        model.add(Dense(1))
-        model.add(Activation('sigmoid'))
-        
-        return model
+class Generator(nn.Module):
+    '''
+    Generator network for a DCGAN. Takes 128 Dimensional latent vector as input and outputs a 64x64x3 image.
+    '''
+    training: bool
 
-    def summary(self):
-        self.generator.summary()
-        self.discriminator.summary()
+    @nn.compact
+    def __call__(self, z):
+        '''
+        z: (n, 1, 1, 64) dimensional latent vector
 
-    def train_step(self, real_images):
-        batch_size = real_images.shape[0]
+        returns:
+            (n, 64, 64, 3) image
+        '''
 
-        # Sample noise as generator input
-        random_latent_noise = tf.random.normal(shape=(batch_size, 1, 1, 100))
+        x = nn.Dense(4 * 4 * 32)(z) # (n, 1, 1, 64) -> (n, 1, 1, 512)
+        x = nn.relu(x)
+        x = nn.Dense(8 * 8 * 32)(x) # (n, 1, 1, 512) -> (n, 1, 1, 2048)
+        x = nn.relu(x)
 
-        # Generate a batch of images
-        generated_images = self.generator(random_latent_noise)
+        x = nn.ConvTranspose(features = 64, kernel_size = (4, 4), strides = (1, 1), padding = 'VALID')(x) # (n, 1, 1, 2048) -> (n, 4, 4, 64)
+        x = nn.relu(x)
+        x = nn.ConvTranspose(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 4, 4, 64) -> (n, 8, 8, 32)
+        x = nn.relu(x)
+        x = nn.ConvTranspose(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 8, 8, 32) -> (n, 16, 16, 16)
+        x = nn.relu(x)
+        x = nn.ConvTranspose(features = 8, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 16) -> (n, 32, 32, 3)
+        x = nn.relu(x)
+        x = nn.ConvTranspose(features = 3, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 3) -> (n, 64, 64, 3)
+        x = nn.tanh(x)
 
-        # Combine with real images
-        combined_images = tf.concat([generated_images, real_images], axis=0)
+        return x
 
-        # Labels for generated and real images
-        labels = tf.concat([tf.ones((batch_size, 1)), tf.zeros((batch_size, 1))], axis=0)
 
-        # Adding random noise to the labels
-        labels += 0.05 * tf.random.uniform(labels.shape)
+class Discriminator(nn.Module):
+    '''
+    Discriminator network for a DCGAN. Takes 64x64x3 image as input and outputs a 1-dimensional probability.
+    '''
+    training: bool
 
-        # Train the discriminator
-        with tf.GradientTape() as tape:
-            predictions = self.discriminator(combined_images)
-            d_loss = self.loss_fn(labels, predictions)
-        
-        grads = tape.gradient(d_loss, self.discriminator.trainable_variables)
-        self.d_optimizer.apply_gradients(zip(grads, self.discriminator.trainable_variables))
+    @nn.compact
+    def __call__(self, image):
+        '''
+        x: (n, 64, 64, 3) image
+        '''
+        x = nn.Conv(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(image) # (n, 64, 64, 3) -> (n, 32, 32, 16)
+        x = nn.leaky_relu(x)
+        x = nn.Conv(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
+        x = nn.leaky_relu(x)
+        x = nn.Conv(features = 64, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
+        x = nn.leaky_relu(x)
 
-        # Sample random points in the latent space
-        random_latent_noise = tf.random.normal(shape=(batch_size, 1, 1, 100))
+        # Flatten the image
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(1024)(x)
+        x = nn.leaky_relu(x)
+        x = nn.Dense(256)(x)
+        x = nn.leaky_relu(x)
+        x = nn.Dense(64)(x)
+        x = nn.leaky_relu(x)
+        x = nn.Dense(1)(x)
 
-        # Assemble labels that say "all real images"
-        misleading_labels = tf.zeros((batch_size, 1))
+        x = nn.sigmoid(x)
 
-        # Train the generator (note that we should *not* update the weights
-        # of the discriminator)!
-        with tf.GradientTape() as tape:
-            predictions = self.discriminator(self.generator(random_latent_noise))
-            g_loss = self.loss_fn(misleading_labels, predictions)
-        
-        grads = tape.gradient(g_loss, self.generator.trainable_variables)
-        self.g_optimizer.apply_gradients(zip(grads, self.generator.trainable_variables))
-
-        # Update metrics
-        self.d_loss_metric.update_state(d_loss)
-        self.g_loss_metric.update_state(g_loss)
-
-        return {
-            'd_loss': self.d_loss_metric.result(),
-            'g_loss': self.g_loss_metric.result(),
-        }
-
-def train(model, directory, epochs, batch_size):
-    images = []
-    
-    for img_name in os.listdir(directory):
-        if 'png' in img_name:
-            images.append(np.array(Image.open(os.path.join(directory, img_name))))
-    
-    images = np.array([img / 255.0 for img in images])
-    images = np.array([cv2.resize(img, (64, 64)) for img in images])
-
-    model.compile(
-        d_optimizer = Adam(learning_rate=0.0002, beta_1=0.5),
-        g_optimizer = Adam(learning_rate=0.0002, beta_1=0.5),
-        loss_fn = tf.keras.losses.BinaryCrossentropy()
-    )
-
-    model.fit(images, epochs=epochs, batch_size=batch_size)
-
-                
+        return x
 
 def main():
-    gan = DCGAN()
+    g = Generator(training = True)
+    d = Discriminator(training = True)
 
-    train(gan, './Shoe Images', epochs=10, batch_size=20)
+    key = jax.random.PRNGKey(0)
+    key, key_g, key_d = jax.random.split(key, 3)
+
+    init_batch_g = jnp.ones((1, 1, 1, 64))
+    params_g = g.init(key_g, init_batch_g)
+
+    init_batch_d = jnp.ones((1, 64, 64, 3))
+    params_d = d.init(key_d, init_batch_d)
+
+    z = jax.random.uniform(key, (1, 1, 1, 64))
+
+    x = g.apply(params_g, z)
+
 
 if __name__ == '__main__':
     main()
