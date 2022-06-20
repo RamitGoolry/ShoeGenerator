@@ -29,10 +29,15 @@ class Generator(nn.Module):
         returns:
             (n, 64, 64, 3) image
         '''
-
-        x = nn.Dense(4 * 4 * 32)(z) # (n, 1, 1, 64) -> (n, 1, 1, 512)
+        x = nn.Dense(128)(z)
         x = nn.relu(x)
-        x = nn.Dense(8 * 8 * 32)(x) # (n, 1, 1, 512) -> (n, 1, 1, 2048)
+        x = nn.Dense(256)(x)
+        x = nn.relu(x)
+        x = nn.Dense(512)(z) # (n, 1, 1, 64) -> (n, 1, 1, 512)
+        x = nn.relu(x)
+        x = nn.Dense(1024)(x)
+        x = nn.relu(x)
+        x = nn.Dense(2048)(x) # (n, 1, 1, 512) -> (n, 1, 1, 2048)
         x = nn.relu(x)
 
         x = nn.ConvTranspose(features = 64, kernel_size = (4, 4), strides = (1, 1), padding = 'VALID')(x) # (n, 1, 1, 2048) -> (n, 4, 4, 64)
@@ -60,11 +65,11 @@ class Discriminator(nn.Module):
         '''
         x: (n, 64, 64, 3) image
         '''
-        x = nn.Conv(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(image) # (n, 64, 64, 3) -> (n, 32, 32, 16)
+        x = nn.Conv(features = 8, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(image) # (n, 64, 64, 3) -> (n, 32, 32, 16)
         x = nn.leaky_relu(x)
-        x = nn.Conv(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
+        x = nn.Conv(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
         x = nn.leaky_relu(x)
-        x = nn.Conv(features = 64, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
+        x = nn.Conv(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
         x = nn.leaky_relu(x)
 
         # Flatten the image
@@ -159,7 +164,7 @@ def make_dataset(folder_path, batch_size):
     return dataset
 
 def main():
-    dataset = make_dataset('./Shoe Images', 40)
+    dataset = make_dataset('./Shoe Images', 210)
 
     rng_key = jax.random.PRNGKey(0)
     rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
@@ -170,14 +175,14 @@ def main():
     init_batch_D = jnp.ones((1, 64, 64, 3), dtype=jnp.float32)
     variables_D = Discriminator(training = True).init(rng_D, init_batch_D)
 
-    optimizer_G = Adam(learning_rate=1e-4, beta1=0.5, beta2=0.999).create(variables_G)
-    optimizer_D = Adam(learning_rate=1e-3, beta1=0.5, beta2=0.999).create(variables_D)
+    optimizer_G = Adam(learning_rate=5e-4, beta1=0.5, beta2=0.999).create(variables_G)
+    optimizer_D = Adam(learning_rate=5e-4, beta1=0.5, beta2=0.999).create(variables_D)
 
-    test_latent_dim = jnp.random.normal(rng_key, shape=(1, 1, 1, 64))
+    test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
 
     run = wandb.init(project='ShoeGAN')
 
-    with tqdm(range(100)) as progress_bar:
+    with tqdm(range(250)) as progress_bar:
         for _ in progress_bar:
             losses_G, losses_D = [], []
 
