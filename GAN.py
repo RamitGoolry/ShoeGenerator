@@ -1,9 +1,15 @@
+import os
+from PIL import Image
+
 import jax
 import jax.numpy as jnp
 import flax
 import flax.linen as nn
+from flax.optim import Adam
 from icecream import ic
 from tqdm import tqdm
+
+from functools import partial
 
 import wandb
 
@@ -69,27 +75,126 @@ class Discriminator(nn.Module):
         x = nn.leaky_relu(x)
         x = nn.Dense(1)(x)
 
-        x = nn.sigmoid(x)
-
         return x
 
+@jax.vmap
+def bce_logits_loss(logit, label):
+    return jnp.maximum(logit, 0) - logit * label + jnp.log(1 + jnp.exp(-jnp.abs(logit)))
+
+def loss_generator(params_G, params_D, batch, rng_key, variables_G, variables_D):
+    z = jax.random.normal(rng_key, shape=(batch.shape[0], 1, 1, 64))
+
+    fake_batch, variables_G = Generator(training = True).apply({
+            'params' : params_G,
+    }, z)
+
+    fake_logits, variables_D = Discriminator(training = True).apply({
+            'params' : params_D,
+    }, fake_batch)
+
+    real_labels = jnp.ones((batch.shape[0],), dtype=jnp.int32)
+    return jnp.mean(bce_logits_loss(fake_logits, real_labels)), (variables_G, variables_D)
+
+def loss_discriminator(params_G, params_D, batch, rng_key, variables_G, variables_D):
+    z = jax.random.normal(rng_key, shape=(batch.shape[0], 1, 1, 64))
+
+    fake_batch, variables_G = Generator(training = True).apply({
+            'params' : params_G,
+    }, z)
+
+    real_logits, variables_D = Discriminator(training = True).apply({
+            'params' : params_D,
+    }, batch)
+
+    fake_logits, variables_D = Discriminator(training = True).apply({
+            'params' : params_D,
+    }, fake_batch)
+
+    real_labels = jnp.ones((batch.shape[0],), dtype=jnp.int32)
+    real_loss = bce_logits_loss(real_logits, real_labels)
+
+    fake_labels = jnp.zeros((batch.shape[0],), dtype=jnp.int32)
+    fake_loss = bce_logits_loss(fake_logits, fake_labels)
+
+    return jnp.mean(real_loss + fake_loss), (variables_G, variables_D)
+
+@partial
+def train_step(rng_key, variables_G, variables_D, optimizer_G, optimizer_D, batch):
+    rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
+
+    (G_loss, (variables_G, variables_D)), grad_G = jax.value_and_grad(loss_generator, has_aux=True)(
+            optimizer_G.target, optimizer_D.target, batch, rng_G, variables_G, variables_D)
+    G_loss = jax.lax.pmean(G_loss)
+    grad_G = jax.lax.pmean(grad_G)
+
+    optimizer_G = optimizer_G.apply_gradient(grad_G)
+
+    (D_loss, (variables_G, variables_D)), grad_D = jax.value_and_grad(loss_discriminator, has_aux=True)(
+            optimizer_D.target, optimizer_G.target, batch, rng_D, variables_G, variables_D)
+
+    D_loss = jax.lax.pmean(D_loss)
+    grad_D = jax.lax.pmean(grad_D)
+
+    return rng_key, variables_G, variables_D, optimizer_G, optimizer_D, G_loss, D_loss
+
+def make_dataset(folder_path, batch_size):
+
+    images = []
+
+    for file in os.listdir(folder_path):
+        if file.endswith(".png"):
+            images.append(jnp.array(Image.open(os.path.join(folder_path, file)).resize((64, 64))))
+
+    images = jnp.array(images)
+    images = images.astype(jnp.float32) / 255.0
+
+    # Shuffle the images
+    rng = jax.random.PRNGKey(0)
+    rng, permutation = jax.random.split(rng, 2)
+    images = jax.random.permutation(permutation, images, independent=True)
+
+    # Split the images into batches
+    dataset = []
+
+    for i in range(0, images.shape[0], batch_size):
+        dataset.append(images[i:i+batch_size])
+
+    return dataset
+
 def main():
-    g = Generator(training = True)
-    d = Discriminator(training = True)
+    dataset = make_dataset('./Shoe Images', 64)
 
-    key = jax.random.PRNGKey(0)
-    key, key_g, key_d = jax.random.split(key, 3)
+    rng_key = jax.random.PRNGKey(0)
+    rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
 
-    init_batch_g = jnp.ones((1, 1, 1, 64))
-    params_g = g.init(key_g, init_batch_g)
+    init_batch_G = jnp.ones((1, 1, 1, 64), dtype=jnp.float32)
+    variables_G = Generator(training = True).init(rng_G, init_batch_G)
 
-    init_batch_d = jnp.ones((1, 64, 64, 3))
-    params_d = d.init(key_d, init_batch_d)
+    init_batch_D = jnp.ones((1, 64, 64, 3), dtype=jnp.float32)
+    variables_D = Discriminator(training = True).init(rng_D, init_batch_D)
 
-    z = jax.random.uniform(key, (1, 1, 1, 64))
+    optimizer_G = Adam(learning_rate=1e-4, beta1=0.5, beta2=0.999).create(variables_G)
+    optimizer_G = flax.jax_utils.replicate(optimizer_G)
 
-    x = g.apply(params_g, z)
+    optimizer_D = Adam(learning_rate=1e-4, beta1=0.5, beta2=0.999).create(variables_D)
+    optimizer_D = flax.jax_utils.replicate(optimizer_D)
 
+    variables_G = flax.jax_utils.replicate(variables_G)
+    variables_D = flax.jax_utils.replicate(variables_D)
+
+    with tqdm(range(100)) as progress_bar:
+        for _ in progress_bar:
+            losses_G, losses_D = [], []
+
+            for batch in dataset:
+                rng_key, variables_G, variables_D, optimizer_G, optimizer_D, G_loss, D_loss = train_step(
+                        rng_key, variables_G, variables_D, optimizer_G, optimizer_D, batch
+                )
+
+                losses_G.append(G_loss)
+                losses_D.append(D_loss)
+
+            progress_bar.set_postfix(losses_G=jnp.mean(losses_G), losses_D=jnp.mean(losses_D))
 
 if __name__ == '__main__':
     main()
