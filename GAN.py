@@ -34,19 +34,25 @@ class Generator(nn.Module):
         x = nn.Dense(256)(x)
         x = nn.relu(x)
         x = nn.Dense(512)(z) # (n, 1, 1, 64) -> (n, 1, 1, 512)
+        x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.relu(x)
         x = nn.Dense(1024)(x)
         x = nn.relu(x)
         x = nn.Dense(2048)(x) # (n, 1, 1, 512) -> (n, 1, 1, 2048)
+        x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.relu(x)
 
         x = nn.ConvTranspose(features = 64, kernel_size = (4, 4), strides = (1, 1), padding = 'VALID')(x) # (n, 1, 1, 2048) -> (n, 4, 4, 64)
+        x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.relu(x)
         x = nn.ConvTranspose(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 4, 4, 64) -> (n, 8, 8, 32)
+        x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.relu(x)
         x = nn.ConvTranspose(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 8, 8, 32) -> (n, 16, 16, 16)
+        x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.relu(x)
         x = nn.ConvTranspose(features = 8, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 16) -> (n, 32, 32, 3)
+        x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.relu(x)
         x = nn.ConvTranspose(features = 3, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 3) -> (n, 64, 64, 3)
         x = nn.tanh(x)
@@ -65,21 +71,21 @@ class Discriminator(nn.Module):
         '''
         x: (n, 64, 64, 3) image
         '''
-        x = nn.Conv(features = 8, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(image) # (n, 64, 64, 3) -> (n, 32, 32, 16)
+        x = nn.Conv(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(image) # (n, 64, 64, 3) -> (n, 32, 32, 16)
         x = nn.leaky_relu(x)
-        x = nn.Conv(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
+        x = nn.Conv(features = 24, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
         x = nn.leaky_relu(x)
         x = nn.Conv(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
         x = nn.leaky_relu(x)
 
         # Flatten the image
         x = x.reshape((x.shape[0], -1))
-        # x = nn.Dense(1024)(x)
-        # x = nn.leaky_relu(x)
+        x = nn.Dense(1024)(x)
+        x = nn.leaky_relu(x)
         x = nn.Dense(256)(x)
         x = nn.leaky_relu(x)
-        # x = nn.Dense(64)(x)
-        # x = nn.leaky_relu(x)
+        x = nn.Dense(64)(x)
+        x = nn.leaky_relu(x)
         x = nn.Dense(1)(x)
 
         return x
@@ -91,12 +97,13 @@ def bce_logits_loss(logit, label):
 def loss_generator(params_G, params_D, batch, rng_key, variables_G, variables_D):
     z = jax.random.normal(rng_key, shape=(batch.shape[0], 1, 1, 64))
 
-    fake_batch = Generator(training = True).apply({
-            'params' : params_G['params'],
-    }, z)
+    fake_batch, variables_G = Generator(training = True).apply({
+            'params' : params_G,
+            'batch_stats' : variables_G['batch_stats'],
+    }, z, mutable=['batch_stats'])
 
     fake_logits = Discriminator(training = True).apply({
-            'params' : params_D['params'],
+            'params' : params_D,
     }, fake_batch)
 
     real_labels = jnp.ones((batch.shape[0],), dtype=jnp.int32)
@@ -105,16 +112,17 @@ def loss_generator(params_G, params_D, batch, rng_key, variables_G, variables_D)
 def loss_discriminator(params_D, params_G, batch, rng_key, variables_G, variables_D):
     z = jax.random.normal(rng_key, shape=(batch.shape[0], 1, 1, 64))
 
-    fake_batch = Generator(training = True).apply({
-            'params' : params_G['params'],
-    }, z)
+    fake_batch, variables_G = Generator(training = True).apply({
+            'params' : params_G,
+            'batch_stats' : variables_G['batch_stats'],
+    }, z, mutable=['batch_stats'])
 
     real_logits = Discriminator(training = True).apply({
-            'params' : params_D['params'],
+            'params' : params_D,
     }, batch)
 
     fake_logits = Discriminator(training = True).apply({
-            'params' : params_D['params'],
+            'params' : params_D,
     }, fake_batch)
 
     real_labels = jnp.ones((batch.shape[0],), dtype=jnp.int32)
@@ -175,14 +183,14 @@ def main():
     init_batch_D = jnp.ones((1, 64, 64, 3), dtype=jnp.float32)
     variables_D = Discriminator(training = True).init(rng_D, init_batch_D)
 
-    optimizer_G = Adam(learning_rate=5e-4, beta1=0.5, beta2=0.999).create(variables_G)
-    optimizer_D = Adam(learning_rate=5e-4, beta1=0.5, beta2=0.999).create(variables_D)
+    optimizer_G = Adam(learning_rate=1e-4, beta1=0.5, beta2=0.999).create(variables_G['params'])
+    optimizer_D = Adam(learning_rate=1e-4, beta1=0.5, beta2=0.999).create(variables_D['params'])
 
     test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
 
     run = wandb.init(project='ShoeGAN')
 
-    with tqdm(range(250)) as progress_bar:
+    with tqdm(range(2000)) as progress_bar:
         for _ in progress_bar:
             losses_G, losses_D = [], []
 
@@ -198,7 +206,8 @@ def main():
 
             # Log Prediction to qualitatively see how the generator is doing
             prediction = Generator(training = False).apply({
-                    'params' : variables_G['params'],
+                    'params' : optimizer_G.target,
+                    'batch_stats' : variables_G['batch_stats'],
             }, test_latent_dim)
 
             # Convert prediction JAX Array to Numpy Array
