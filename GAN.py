@@ -5,13 +5,9 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
-import flax
 import flax.linen as nn
 from flax.optim import Adam
-from icecream import ic
 from tqdm import tqdm
-
-from functools import partial
 
 import wandb
 
@@ -73,9 +69,9 @@ class Discriminator(nn.Module):
         '''
         x = nn.Conv(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(image) # (n, 64, 64, 3) -> (n, 32, 32, 16)
         x = nn.leaky_relu(x)
-        x = nn.Conv(features = 24, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
+        x = nn.Conv(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
         x = nn.leaky_relu(x)
-        x = nn.Conv(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
+        x = nn.Conv(features = 64, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
         x = nn.leaky_relu(x)
 
         # Flatten the image
@@ -151,8 +147,8 @@ def train_step(rng_key, variables_G, variables_D, optimizer_G, optimizer_D, batc
 def make_dataset(folder_path, batch_size):
     images = []
 
-    for file in os.listdir(folder_path):
-        if file.endswith(".png"):
+    for file in tqdm(os.listdir(folder_path), desc = 'Loading Files'):
+        if file.endswith(".jpg") or file.endswith('.png'):
             images.append(jnp.array(Image.open(os.path.join(folder_path, file)).resize((64, 64))))
 
     images = jnp.array(images)
@@ -172,9 +168,11 @@ def make_dataset(folder_path, batch_size):
     return dataset
 
 def main():
-    dataset = make_dataset('./Shoe Images', 210)
+    dataset = make_dataset('./Shoe_Dataset', 500)
 
-    rng_key = jax.random.PRNGKey(0)
+    print(f"Loaded Dataset of Shape : {len(dataset)}, {dataset[0].shape}")
+
+    rng_key = jax.random.PRNGKey(42)
     rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
 
     init_batch_G = jnp.ones((1, 1, 1, 64), dtype=jnp.float32)
