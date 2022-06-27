@@ -154,11 +154,15 @@ class GANTrainer:
         ic(type(grad_G))
         ic(type(self.opt_G_state[0]))
         ic(type(self.opt_G_state[1]))
+
+        ic(jax.tree_map(lambda x: x.shape, variables_G['params'])) # Display shapes of all outputs
+        ic(jax.tree_map(lambda x: x.shape, self.opt_G_state[0]))
+
         try:
             self.opt_G_state, updates = self.optimizer_G.update(grad_G, self.opt_G_state)
             variables_G['params'] = optax.apply_updates(variables_G['params'], updates)
         except Exception as e:
-            print(type(e))
+            print(str(e)[:1000])
             exit(1)
 
         (D_loss, (variables_G, variables_D)), grad_D = jax.value_and_grad(self.loss_discriminator, has_aux=True)(
