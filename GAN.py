@@ -12,6 +12,7 @@ from optax import adam
 
 from tqdm import tqdm
 import wandb
+from icecream import ic
 
 class Generator(nn.Module):
     '''
@@ -106,7 +107,7 @@ class GANTrainer:
         self.rng, rng_G = jax.random.split(self.rng, 2)
         z = jax.random.normal(rng_G, shape=(batch.shape[0], 1, 1, 64))
 
-        fake_batch, variables_G = Generator(training = True).apply({
+        fake_batch, variables_G_batch = Generator(training = True).apply({ # TODO batch stats update
                 'params' : params_G,
                 'batch_stats' : variables_G['batch_stats'],
         }, z, mutable=['batch_stats'])
@@ -122,7 +123,7 @@ class GANTrainer:
         self.rng, rng_D = jax.random.split(self.rng, 2)
         z = jax.random.normal(rng_D, shape=(batch.shape[0], 1, 1, 64))
 
-        fake_batch, variables_G = Generator(training = True).apply({
+        fake_batch, variables_G_batch = Generator(training = True).apply({ # TODO batch stats update
                 'params' : params_G,
                 'batch_stats' : variables_G['batch_stats'],
         }, z, mutable=['batch_stats'])
@@ -145,12 +146,24 @@ class GANTrainer:
 
     def train_step(self, variables_G, variables_D, batch):
         (G_loss, (variables_G, variables_D)), grad_G = jax.value_and_grad(self.loss_generator, has_aux=True)(
-                self.optimizer_G.target, self.optimizer_D.target, batch, variables_G, variables_D)
-        self.opt_G_state, updates = self.optimizer_G.update(grad_G, self.opt_G_state)
-        variables_G['params'] = optax.apply_updates(variables_G['params'], updates)
+                variables_G['params'], variables_D['params'], batch, variables_G, variables_D
+        )
+
+        # Grad_G is a FrozenDict
+        # opt_G_state is a tuple
+        ic(type(grad_G))
+        ic(type(self.opt_G_state[0]))
+        ic(type(self.opt_G_state[1]))
+        try:
+            self.opt_G_state, updates = self.optimizer_G.update(grad_G, self.opt_G_state)
+            variables_G['params'] = optax.apply_updates(variables_G['params'], updates)
+        except Exception as e:
+            print(type(e))
+            exit(1)
 
         (D_loss, (variables_G, variables_D)), grad_D = jax.value_and_grad(self.loss_discriminator, has_aux=True)(
-                self.optimizer_D.target, self.optimizer_G.target, batch, variables_G, variables_D)
+                variables_D['params'], variables_D['params'], batch, variables_G, variables_D
+        )
         self.opt_D_state, updates = self.optimizer_D.update(grad_D, self.opt_D_state)
         variables_D['params'] = optax.apply_updates(variables_D['params'], updates)
 
@@ -193,11 +206,14 @@ def main():
     init_batch_D = jnp.ones((1, 64, 64, 3), dtype=jnp.float32)
     variables_D = Discriminator(training = True).init(rng_D, init_batch_D)
 
+    variables_G = variables_G.unfreeze()
+    variables_D = variables_D.unfreeze()
+
     trainer = GANTrainer(variables_G, variables_D, rng_key=rng_key)
 
     test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
 
-    run = wandb.init(project='ShoeGAN')
+    run = wandb.init(project='ShoeGAN', mode='disabled')
 
     with tqdm(range(2000)) as progress_bar:
         for _ in progress_bar:
