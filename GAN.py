@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from flax.optim import Adam
 from tqdm import tqdm
+import time
 
 import wandb
 
@@ -91,12 +92,15 @@ def bce_logits_loss(logit, label):
     return jnp.maximum(logit, 0) - logit * label + jnp.log(1 + jnp.exp(-jnp.abs(logit)))
 
 class GANTrainer:
-    def __init__(self, variables_G, variables_D):        
+    def __init__(self, variables_G, variables_D, rng_key = None):
         self.optimizer_G = Adam(learning_rate=1e-4, beta1=0.5, beta2=0.999).create(variables_G['params'])
         self.optimizer_D = Adam(learning_rate=1e-4, beta1=0.5, beta2=0.999).create(variables_D['params'])
 
-    def loss_generator(self, params_G, params_D, batch, rng_key, variables_G, variables_D):
-        z = jax.random.normal(rng_key, shape=(batch.shape[0], 1, 1, 64))
+        self.rng = rng_key if rng_key is not None else jax.random.PRNGKey(int(time.time()))
+
+    def loss_generator(self, params_G, params_D, batch, variables_G, variables_D):
+        G_rng, self.rng = jax.random.split(self.rng, 2)
+        z = jax.random.normal(G_rng, shape=(batch.shape[0], 1, 1, 64))
 
         fake_batch, variables_G = Generator(training = True).apply({
                 'params' : params_G,
@@ -107,11 +111,11 @@ class GANTrainer:
                 'params' : params_D,
         }, fake_batch)
 
-        real_labels = jnp.ones((batch.shape[0],), dtype=jnp.int32)
-        return jnp.mean(bce_logits_loss(fake_logits, real_labels)), (variables_G, variables_D)
+        return -jnp.mean(fake_logits), (variables_G, variables_D)
 
-    def loss_discriminator(self, params_D, params_G, batch, rng_key, variables_G, variables_D):
-        z = jax.random.normal(rng_key, shape=(batch.shape[0], 1, 1, 64))
+    def loss_discriminator(self, params_D, params_G, batch, variables_G, variables_D):
+        D_rng, self.rng = jax.random.split(self.rng, 2)
+        z = jax.random.normal(D_rng, shape=(batch.shape[0], 1, 1, 64))
 
         fake_batch, variables_G = Generator(training = True).apply({
                 'params' : params_G,
@@ -126,26 +130,31 @@ class GANTrainer:
                 'params' : params_D,
         }, fake_batch)
 
-        real_labels = jnp.ones((batch.shape[0],), dtype=jnp.int32)
-        real_loss = bce_logits_loss(real_logits, real_labels)
 
-        fake_labels = jnp.zeros((batch.shape[0],), dtype=jnp.int32)
-        fake_loss = bce_logits_loss(fake_logits, fake_labels)
+        return jnp.mean(real_logits) - jnp.mean(fake_logits), (variables_G, variables_D)
 
-        return jnp.mean(real_loss + fake_loss), (variables_G, variables_D)
+    def train_step(self, variables_G, variables_D, batch, n_critic, clip):
 
-    def train_step(self, rng_key, variables_G, variables_D, batch):
-        rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
+        avg_D_loss = 0
+
+        # Train the discriminator
+        for _ in range(n_critic):
+            (D_loss, (variables_G, variables_D)), grad_D = jax.value_and_grad(self.loss_discriminator, has_aux=True)(
+                    self.optimizer_D.target, self.optimizer_G.target, batch, variables_G, variables_D
+            )
+            avg_D_loss += D_loss
+            self.optimizer_D = self.optimizer_D.apply_gradients(grad_D)
+
+            # Clip the discriminator weights
+            variables_D['params'] = jax.nn.clip_by_norm(variables_D['params'], clip)
+
+        avg_D_loss /= n_critic
 
         (G_loss, (variables_G, variables_D)), grad_G = jax.value_and_grad(self.loss_generator, has_aux=True)(
-                self.optimizer_G.target, self.optimizer_D.target, batch, rng_G, variables_G, variables_D)
+                self.optimizer_G.target, self.optimizer_D.target, batch, variables_G, variables_D)
         self.optimizer_G = self.optimizer_G.apply_gradient(grad_G)
 
-        (D_loss, (variables_G, variables_D)), grad_D = jax.value_and_grad(self.loss_discriminator, has_aux=True)(
-                self.optimizer_D.target, self.optimizer_G.target, batch, rng_D, variables_G, variables_D)
-        self.optimizer_D = self.optimizer_D.apply_gradient(grad_D)
-
-        return rng_key, variables_G, variables_D, G_loss, D_loss
+        return variables_G, variables_D, G_loss, avg_D_loss
 
 def make_dataset(folder_path, batch_size):
     images = []
@@ -188,15 +197,15 @@ def main():
 
     test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
 
-    run = wandb.init(project='ShoeGAN')
+    run = wandb.init(project='ShoeGAN', mode='disabled')
 
     with tqdm(range(2000)) as progress_bar:
         for _ in progress_bar:
             losses_G, losses_D = [], []
 
             for batch in dataset:
-                rng_key, variables_G, variables_D, G_loss, D_loss = trainer.train_step(
-                        rng_key, variables_G, variables_D, batch
+                variables_G, variables_D, G_loss, D_loss = trainer.train_step(
+                        variables_G, variables_D, batch, n_critic = 3, clip = 0.01
                 )
 
                 losses_G.append(G_loss)
