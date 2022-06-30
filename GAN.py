@@ -116,7 +116,7 @@ class GANTrainer:
                 'params' : params_D,
         }, fake_batch)
 
-        return jnp.mean(-fake_logits), (variables_G, variables_D)
+        return -jnp.mean(fake_logits), (variables_G, variables_D)
 
     def loss_discriminator(self, params_D, params_G, batch, variables_G, variables_D):
         D_rng, self.rng = jax.random.split(self.rng, 2)
@@ -135,7 +135,8 @@ class GANTrainer:
                 'params' : params_D,
         }, fake_batch)
 
-        return jnp.mean(real_logits) - jnp.mean(fake_logits), (variables_G, variables_D)
+        # fake - real is done so that we can use a simple gradient descent implementation v/s gradient ascent.
+        return jnp.mean(fake_logits) - jnp.mean(real_logits), (variables_G, variables_D)
 
     def _clip_tree(self, tree, clip):
         return jax.tree_util.tree_map(lambda x: jnp.clip(x, -clip, clip), tree)
@@ -152,7 +153,7 @@ class GANTrainer:
             self.optimizer_D = self.optimizer_D.apply_gradient(grad_D)
 
             # Clip the discriminator weights
-            variables_D['params'] = self._clip_tree(variables_D['params'], clip)
+            self.optimizer_D.target = self._clip_tree(self.optimizer_D.target, clip) # FIXME can not clip optimizer target
 
         avg_D_loss /= n_critic
 
@@ -160,28 +161,28 @@ class GANTrainer:
                 self.optimizer_G.target, self.optimizer_D.target, batch, variables_G, variables_D)
         self.optimizer_G = self.optimizer_G.apply_gradient(grad_G)
 
-        if self.wandb_run:
-            histograms = {}
+        # if self.wandb_run:
+            # histograms = {}
 
-            for layer, param in self.optimizer_D.target.items():
-                if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
-                    for param_name, param_value in param.items():
-                        histograms[f'Discriminator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
-                elif type(param) == jnp.DeviceArray:
-                    histograms[f'Discriminator/{layer}'] = np.array(param)
-                else:
-                    print("ERROR : Unknown type for Discriminator parameter:", type(param))
+            # for layer, param in self.optimizer_D.target.items():
+                # if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
+                    # for param_name, param_value in param.items():
+                        # histograms[f'Discriminator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
+                # elif type(param) == jnp.DeviceArray:
+                    # histograms[f'Discriminator/{layer}'] = np.array(param)
+                # else:
+                    # print("ERROR : Unknown type for Discriminator parameter:", type(param))
 
-            for layer, param in self.optimizer_G.target.items():
-                if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
-                    for param_name, param_value in param.items():
-                        histograms[f'Generator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
-                elif type(param) == jnp.DeviceArray:
-                    histograms[f'Generator/{layer}'] = np.array(param)
-                else:
-                    print("ERROR : Unknown type for Generator parameter:", type(param))
+            # for layer, param in self.optimizer_G.target.items():
+                # if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
+                    # for param_name, param_value in param.items():
+                        # histograms[f'Generator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
+                # elif type(param) == jnp.DeviceArray:
+                    # histograms[f'Generator/{layer}'] = np.array(param)
+                # else:
+                    # print("ERROR : Unknown type for Generator parameter:", type(param))
 
-            self.wandb_run.log(histograms, commit=False)
+            # self.wandb_run.log(histograms, commit=False)
 
         return variables_G, variables_D, G_loss, avg_D_loss
 
