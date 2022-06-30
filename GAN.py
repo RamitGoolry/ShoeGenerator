@@ -5,10 +5,12 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
+import flax
 import flax.linen as nn
-from flax.optim import Adam
+from flax.optim import Adam, RMSProp
 from tqdm import tqdm
 import time
+from icecream import ic
 
 import wandb
 
@@ -92,11 +94,14 @@ def bce_logits_loss(logit, label):
     return jnp.maximum(logit, 0) - logit * label + jnp.log(1 + jnp.exp(-jnp.abs(logit)))
 
 class GANTrainer:
-    def __init__(self, variables_G, variables_D, rng_key = None):
-        self.optimizer_G = Adam(learning_rate=1e-4, beta1=0.5, beta2=0.999).create(variables_G['params'])
-        self.optimizer_D = Adam(learning_rate=1e-4, beta1=0.5, beta2=0.999).create(variables_D['params'])
+    def __init__(self, variables_G, variables_D, rng_key = None, wandb_run = None):
+        self.optimizer_G = RMSProp(learning_rate=1e-4).create(variables_G['params'])
+        self.optimizer_D = RMSProp(learning_rate=1e-4).create(variables_D['params'])
 
         self.rng = rng_key if rng_key is not None else jax.random.PRNGKey(int(time.time()))
+
+        if wandb_run:
+            self.wandb_run = wandb_run
 
     def loss_generator(self, params_G, params_D, batch, variables_G, variables_D):
         G_rng, self.rng = jax.random.split(self.rng, 2)
@@ -111,7 +116,7 @@ class GANTrainer:
                 'params' : params_D,
         }, fake_batch)
 
-        return -jnp.mean(fake_logits), (variables_G, variables_D)
+        return jnp.mean(-fake_logits), (variables_G, variables_D)
 
     def loss_discriminator(self, params_D, params_G, batch, variables_G, variables_D):
         D_rng, self.rng = jax.random.split(self.rng, 2)
@@ -130,11 +135,12 @@ class GANTrainer:
                 'params' : params_D,
         }, fake_batch)
 
-
         return jnp.mean(real_logits) - jnp.mean(fake_logits), (variables_G, variables_D)
 
-    def train_step(self, variables_G, variables_D, batch, n_critic, clip):
+    def _clip_tree(self, tree, clip):
+        return jax.tree_util.tree_map(lambda x: jnp.clip(x, -clip, clip), tree)
 
+    def train_step(self, variables_G, variables_D, batch, n_critic, clip):
         avg_D_loss = 0
 
         # Train the discriminator
@@ -143,16 +149,39 @@ class GANTrainer:
                     self.optimizer_D.target, self.optimizer_G.target, batch, variables_G, variables_D
             )
             avg_D_loss += D_loss
-            self.optimizer_D = self.optimizer_D.apply_gradients(grad_D)
+            self.optimizer_D = self.optimizer_D.apply_gradient(grad_D)
 
             # Clip the discriminator weights
-            variables_D['params'] = jax.nn.clip_by_norm(variables_D['params'], clip)
+            variables_D['params'] = self._clip_tree(variables_D['params'], clip)
 
         avg_D_loss /= n_critic
 
         (G_loss, (variables_G, variables_D)), grad_G = jax.value_and_grad(self.loss_generator, has_aux=True)(
                 self.optimizer_G.target, self.optimizer_D.target, batch, variables_G, variables_D)
         self.optimizer_G = self.optimizer_G.apply_gradient(grad_G)
+
+        if self.wandb_run:
+            histograms = {}
+
+            for layer, param in self.optimizer_D.target.items():
+                if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
+                    for param_name, param_value in param.items():
+                        histograms[f'Discriminator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
+                elif type(param) == jnp.DeviceArray:
+                    histograms[f'Discriminator/{layer}'] = np.array(param)
+                else:
+                    print("ERROR : Unknown type for Discriminator parameter:", type(param))
+
+            for layer, param in self.optimizer_G.target.items():
+                if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
+                    for param_name, param_value in param.items():
+                        histograms[f'Generator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
+                elif type(param) == jnp.DeviceArray:
+                    histograms[f'Generator/{layer}'] = np.array(param)
+                else:
+                    print("ERROR : Unknown type for Generator parameter:", type(param))
+
+            self.wandb_run.log(histograms, commit=False)
 
         return variables_G, variables_D, G_loss, avg_D_loss
 
@@ -193,19 +222,22 @@ def main():
     init_batch_D = jnp.ones((1, 64, 64, 3), dtype=jnp.float32)
     variables_D = Discriminator(training = True).init(rng_D, init_batch_D)
 
-    trainer = GANTrainer(variables_G, variables_D)
+    variables_G = variables_G.unfreeze()
+    variables_D = variables_D.unfreeze()
+
+    run = wandb.init(project='ShoeGAN')
+
+    trainer = GANTrainer(variables_G, variables_D, wandb_run = run)
 
     test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
 
-    run = wandb.init(project='ShoeGAN', mode='disabled')
-
-    with tqdm(range(2000)) as progress_bar:
-        for _ in progress_bar:
+    with tqdm(range(100)) as progress_bar:
+        for epoch in progress_bar:
             losses_G, losses_D = [], []
 
             for batch in dataset:
                 variables_G, variables_D, G_loss, D_loss = trainer.train_step(
-                        variables_G, variables_D, batch, n_critic = 3, clip = 0.01
+                        variables_G, variables_D, batch, n_critic = 1, clip = 0.001
                 )
 
                 losses_G.append(G_loss)
@@ -213,22 +245,26 @@ def main():
 
             progress_bar.set_postfix(losses_G=jnp.mean(jnp.array(losses_G)), losses_D=jnp.mean(jnp.array(losses_D)))
 
-            # Log Prediction to qualitatively see how the generator is doing
-            prediction = Generator(training = False).apply({
-                    'params' : trainer.optimizer_G.target,
-                    'batch_stats' : variables_G['batch_stats'],
-            }, test_latent_dim)
-
-            # Convert prediction JAX Array to Numpy Array
-            prediction = np.array(prediction)
-
-            run.log({
+            wandb_dict = {
                     'Generator Loss' : jnp.mean(jnp.array(losses_G)),
-                    'Discriminator Loss' : jnp.mean(jnp.array(losses_D)),
-                    'Generator Image' : wandb.Image(prediction[0, :, :, :])
-            })
+                    'Discriminator Loss' : jnp.mean(jnp.array(losses_D))
+            }
 
+            if epoch % 10 == 0:
+                # Log Prediction to qualitatively see how the generator is doing
+                prediction = Generator(training = False).apply({
+                        'params' : trainer.optimizer_G.target,
+                        'batch_stats' : variables_G['batch_stats'],
+                }, test_latent_dim)
 
+                # Convert prediction JAX Array to Numpy Array
+                prediction = np.array(prediction)
+
+                wandb_dict.update({
+                    'Prediction' : wandb.Image(prediction[0, : , :, :])
+                })
+
+            run.log(wandb_dict)
 
 if __name__ == '__main__':
     main()
