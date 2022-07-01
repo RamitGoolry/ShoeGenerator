@@ -1,5 +1,6 @@
 import os
 from PIL import Image
+from flax import training
 
 import numpy as np
 
@@ -7,12 +8,15 @@ import jax
 import jax.numpy as jnp
 import flax
 import flax.linen as nn
-from flax.optim import Adam, RMSProp
+from flax.training import train_state
+import optax
+from optax import adam
+
+from typing import Any
 from tqdm import tqdm
 import time
-from icecream import ic
-
 import wandb
+from icecream import ic
 
 class Generator(nn.Module):
     '''
@@ -89,42 +93,53 @@ class Discriminator(nn.Module):
 
         return x
 
+class BatchNormTrainState(train_state.TrainState):
+    batch_stats: Any
+
+def initialize_train_state(model_type, input_shape, tx, rng_key, **kwargs):
+    model = model_type(**kwargs)
+    variables = model.init(rng_key, jnp.ones(input_shape))
+
+    return BatchNormTrainState.create(
+            apply_fn = model.apply,
+            tx = tx,
+            params = variables.get('params'),
+            batch_stats = variables.get('batch_stats')
+    )
+
 @jax.vmap
 def bce_logits_loss(logit, label):
     return jnp.maximum(logit, 0) - logit * label + jnp.log(1 + jnp.exp(-jnp.abs(logit)))
 
 class GANTrainer:
-    def __init__(self, variables_G, variables_D, rng_key = None, wandb_run = None):
-        self.optimizer_G = RMSProp(learning_rate=1e-4).create(variables_G['params'])
-        self.optimizer_D = RMSProp(learning_rate=1e-4).create(variables_D['params'])
+    def __init__(self, rng_key):
+        self.optimizer_G = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
+        self.optimizer_D = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
 
-        self.rng = rng_key if rng_key is not None else jax.random.PRNGKey(int(time.time()))
-
-        if wandb_run:
-            self.wandb_run = wandb_run
-
+        self.rng = rng_key
+          
     def loss_generator(self, params_G, params_D, batch, variables_G, variables_D):
-        G_rng, self.rng = jax.random.split(self.rng, 2)
-        z = jax.random.normal(G_rng, shape=(batch.shape[0], 1, 1, 64))
+        self.rng, rng_G = jax.random.split(self.rng, 2)
+        z = jax.random.normal(rng_G, shape=(batch.shape[0], 1, 1, 64))
 
-        fake_batch, variables_G = Generator(training = True).apply({
+        fake_batch, mutables = Generator(training = True).apply({
                 'params' : params_G,
-                'batch_stats' : variables_G['batch_stats'],
+                'batch_stats' : variables_G.batch_stats
         }, z, mutable=['batch_stats'])
 
         fake_logits = Discriminator(training = True).apply({
                 'params' : params_D,
         }, fake_batch)
-
-        return -jnp.mean(fake_logits), (variables_G, variables_D)
-
+        
+        return -jnp.mean(fake_logits), mutables
+        
     def loss_discriminator(self, params_D, params_G, batch, variables_G, variables_D):
-        D_rng, self.rng = jax.random.split(self.rng, 2)
-        z = jax.random.normal(D_rng, shape=(batch.shape[0], 1, 1, 64))
+        self.rng, rng_D = jax.random.split(self.rng, 2)
+        z = jax.random.normal(rng_D, shape=(batch.shape[0], 1, 1, 64))
 
-        fake_batch, variables_G = Generator(training = True).apply({
+        fake_batch, _ = Generator(training = True).apply({ 
                 'params' : params_G,
-                'batch_stats' : variables_G['batch_stats'],
+                'batch_stats' : variables_G.batch_stats,
         }, z, mutable=['batch_stats'])
 
         real_logits = Discriminator(training = True).apply({
@@ -136,7 +151,7 @@ class GANTrainer:
         }, fake_batch)
 
         # fake - real is done so that we can use a simple gradient descent implementation v/s gradient ascent.
-        return jnp.mean(fake_logits) - jnp.mean(real_logits), (variables_G, variables_D)
+        return jnp.mean(fake_logits) - jnp.mean(real_logits)
 
     def _clip_tree(self, tree, clip):
         return jax.tree_util.tree_map(lambda x: jnp.clip(x, -clip, clip), tree)
@@ -146,21 +161,22 @@ class GANTrainer:
 
         # Train the discriminator
         for _ in range(n_critic):
-            (D_loss, (variables_G, variables_D)), grad_D = jax.value_and_grad(self.loss_discriminator, has_aux=True)(
+            D_loss, grad_D = jax.value_and_grad(self.loss_discriminator, has_aux=False)(
                     self.optimizer_D.target, self.optimizer_G.target, batch, variables_G, variables_D
             )
             avg_D_loss += D_loss
-            self.optimizer_D = self.optimizer_D.apply_gradient(grad_D)
-
-            # Clip the discriminator weights
-            self.optimizer_D.target = self._clip_tree(self.optimizer_D.target, clip) # FIXME can not clip optimizer target
-
+            variables_D = variables_D.apply_gradients(grads=grad_D)
+            
+            # TODO Clip
+            
         avg_D_loss /= n_critic
 
-        (G_loss, (variables_G, variables_D)), grad_G = jax.value_and_grad(self.loss_generator, has_aux=True)(
-                self.optimizer_G.target, self.optimizer_D.target, batch, variables_G, variables_D)
-        self.optimizer_G = self.optimizer_G.apply_gradient(grad_G)
+        (G_loss, mutables), grad_G = jax.value_and_grad(self.loss_generator, has_aux=True)(
+                variables_G.params, variables_D.params, batch, variables_G, variables_D
+        )
 
+        variables_G = variables_G.apply_gradients(grads=grad_G, batch_stats=mutables['batch_stats'])
+        
         # if self.wandb_run:
             # histograms = {}
 
@@ -217,14 +233,13 @@ def main():
     rng_key = jax.random.PRNGKey(42)
     rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
 
-    init_batch_G = jnp.ones((1, 1, 1, 64), dtype=jnp.float32)
-    variables_G = Generator(training = True).init(rng_G, init_batch_G)
+    trainer = GANTrainer(rng_key=rng_key)
 
-    init_batch_D = jnp.ones((1, 64, 64, 3), dtype=jnp.float32)
-    variables_D = Discriminator(training = True).init(rng_D, init_batch_D)
 
-    variables_G = variables_G.unfreeze()
-    variables_D = variables_D.unfreeze()
+    variables_G = initialize_train_state(Generator, (1, 1, 1, 64), trainer.optimizer_G, rng_G, training=True)
+    variables_D = initialize_train_state(Discriminator, (1, 64, 64, 3), trainer.optimizer_D, rng_D, training=True)
+
+    test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
 
     run = wandb.init(project='ShoeGAN')
 
@@ -246,24 +261,17 @@ def main():
 
             progress_bar.set_postfix(losses_G=jnp.mean(jnp.array(losses_G)), losses_D=jnp.mean(jnp.array(losses_D)))
 
+            # Log Prediction to qualitatively see how the generator is doing
+            prediction = Generator(training = False).apply({
+                    'params' : variables_G.params,
+                    'batch_stats' : variables_G.batch_stats,
+            }, test_latent_dim)
+
             wandb_dict = {
                     'Generator Loss' : jnp.mean(jnp.array(losses_G)),
                     'Discriminator Loss' : jnp.mean(jnp.array(losses_D))
+                    'Prediction' : prediction
             }
-
-            if epoch % 10 == 0:
-                # Log Prediction to qualitatively see how the generator is doing
-                prediction = Generator(training = False).apply({
-                        'params' : trainer.optimizer_G.target,
-                        'batch_stats' : variables_G['batch_stats'],
-                }, test_latent_dim)
-
-                # Convert prediction JAX Array to Numpy Array
-                prediction = np.array(prediction)
-
-                wandb_dict.update({
-                    'Prediction' : wandb.Image(prediction[0, : , :, :])
-                })
 
             run.log(wandb_dict)
 
