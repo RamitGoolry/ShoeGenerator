@@ -17,6 +17,7 @@ from tqdm import tqdm
 import time
 import wandb
 from icecream import ic
+from dataclasses import dataclass
 
 class Generator(nn.Module):
     '''
@@ -110,6 +111,9 @@ def initialize_train_state(model_type, input_shape, tx, rng_key, **kwargs):
 @jax.vmap
 def bce_logits_loss(logit, label):
     return jnp.maximum(logit, 0) - logit * label + jnp.log(1 + jnp.exp(-jnp.abs(logit)))
+
+class LipschitzMode:
+    pass
 
 class GANTrainer:
     def __init__(self, rng_key = None, clip = 0.01):
