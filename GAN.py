@@ -112,12 +112,14 @@ def bce_logits_loss(logit, label):
     return jnp.maximum(logit, 0) - logit * label + jnp.log(1 + jnp.exp(-jnp.abs(logit)))
 
 class GANTrainer:
-    def __init__(self, rng_key):
+    def __init__(self, rng_key = None, clip = 0.01):
         self.optimizer_G = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
         self.optimizer_D = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
 
-        self.rng = rng_key
-          
+        self.clip_transform = optax.clip(max_delta = clip)
+
+        self.rng = rng_key if rng_key is not None else jax.random.PRNGKey(int(time.time()))
+
     def loss_generator(self, params_G, params_D, batch, variables_G, variables_D):
         self.rng, rng_G = jax.random.split(self.rng, 2)
         z = jax.random.normal(rng_G, shape=(batch.shape[0], 1, 1, 64))
@@ -130,14 +132,14 @@ class GANTrainer:
         fake_logits = Discriminator(training = True).apply({
                 'params' : params_D,
         }, fake_batch)
-        
+
         return -jnp.mean(fake_logits), mutables
-        
+
     def loss_discriminator(self, params_D, params_G, batch, variables_G, variables_D):
         self.rng, rng_D = jax.random.split(self.rng, 2)
         z = jax.random.normal(rng_D, shape=(batch.shape[0], 1, 1, 64))
 
-        fake_batch, _ = Generator(training = True).apply({ 
+        fake_batch, _ = Generator(training = True).apply({
                 'params' : params_G,
                 'batch_stats' : variables_G.batch_stats,
         }, z, mutable=['batch_stats'])
@@ -156,19 +158,19 @@ class GANTrainer:
     def _clip_tree(self, tree, clip):
         return jax.tree_util.tree_map(lambda x: jnp.clip(x, -clip, clip), tree)
 
-    def train_step(self, variables_G, variables_D, batch, n_critic, clip):
+    def train_step(self, variables_G, variables_D, batch, n_critic):
         avg_D_loss = 0
 
         # Train the discriminator
         for _ in range(n_critic):
             D_loss, grad_D = jax.value_and_grad(self.loss_discriminator, has_aux=False)(
-                    self.optimizer_D.target, self.optimizer_G.target, batch, variables_G, variables_D
+                    variables_D.params, variables_G.params, batch, variables_G, variables_D
             )
             avg_D_loss += D_loss
             variables_D = variables_D.apply_gradients(grads=grad_D)
-            
-            # TODO Clip
-            
+
+            # variables_D.params = self.clip_transform.update(variables_D.params)
+
         avg_D_loss /= n_critic
 
         (G_loss, mutables), grad_G = jax.value_and_grad(self.loss_generator, has_aux=True)(
@@ -176,7 +178,7 @@ class GANTrainer:
         )
 
         variables_G = variables_G.apply_gradients(grads=grad_G, batch_stats=mutables['batch_stats'])
-        
+
         # if self.wandb_run:
             # histograms = {}
 
@@ -235,7 +237,6 @@ def main():
 
     trainer = GANTrainer(rng_key=rng_key)
 
-
     variables_G = initialize_train_state(Generator, (1, 1, 1, 64), trainer.optimizer_G, rng_G, training=True)
     variables_D = initialize_train_state(Discriminator, (1, 64, 64, 3), trainer.optimizer_D, rng_D, training=True)
 
@@ -243,17 +244,13 @@ def main():
 
     run = wandb.init(project='ShoeGAN')
 
-    trainer = GANTrainer(variables_G, variables_D, wandb_run = run)
-
-    test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
-
-    with tqdm(range(100)) as progress_bar:
+    with tqdm(range(1000)) as progress_bar:
         for epoch in progress_bar:
             losses_G, losses_D = [], []
 
             for batch in dataset:
                 variables_G, variables_D, G_loss, D_loss = trainer.train_step(
-                        variables_G, variables_D, batch, n_critic = 1, clip = 0.001
+                        variables_G, variables_D, batch, n_critic = 1
                 )
 
                 losses_G.append(G_loss)
@@ -269,8 +266,8 @@ def main():
 
             wandb_dict = {
                     'Generator Loss' : jnp.mean(jnp.array(losses_G)),
-                    'Discriminator Loss' : jnp.mean(jnp.array(losses_D))
-                    'Prediction' : prediction
+                    'Discriminator Loss' : jnp.mean(jnp.array(losses_D)),
+                    'Prediction' : wandb.Image(np.array(prediction))
             }
 
             run.log(wandb_dict)
