@@ -77,8 +77,10 @@ class Discriminator(nn.Module):
         '''
         x = nn.Conv(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(image) # (n, 64, 64, 3) -> (n, 32, 32, 16)
         x = nn.leaky_relu(x)
+
         x = nn.Conv(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
         x = nn.leaky_relu(x)
+
         x = nn.Conv(features = 64, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
         x = nn.leaky_relu(x)
 
@@ -86,10 +88,13 @@ class Discriminator(nn.Module):
         x = x.reshape((x.shape[0], -1))
         x = nn.Dense(1024)(x)
         x = nn.leaky_relu(x)
+
         x = nn.Dense(256)(x)
         x = nn.leaky_relu(x)
+
         x = nn.Dense(64)(x)
         x = nn.leaky_relu(x)
+
         x = nn.Dense(1)(x)
 
         return x
@@ -108,19 +113,31 @@ def initialize_train_state(model_type, input_shape, tx, rng_key, **kwargs):
             batch_stats = variables.get('batch_stats')
     )
 
-@jax.vmap
-def bce_logits_loss(logit, label):
-    return jnp.maximum(logit, 0) - logit * label + jnp.log(1 + jnp.exp(-jnp.abs(logit)))
-
 class LipschitzMode:
     pass
 
-class GANTrainer:
-    def __init__(self, rng_key = None, clip = 0.01):
-        self.optimizer_G = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
-        self.optimizer_D = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
+@dataclass
+class GradientPenalty(LipschitzMode):
+    lambda_ : float
 
-        self.clip_transform = optax.clip(max_delta = clip)
+def discriminator_forward(params_D, image):
+    if len(image.shape) == 3:
+        image = image.reshape((1, *image.shape))
+    return Discriminator(training = True).apply({
+        'params': params_D,
+    }, image)[0][0]
+
+discriminator_weight_penalty = jax.vmap(jax.grad(discriminator_forward, argnums = 1), in_axes=(None, 0))
+
+class GANTrainer:
+    def __init__(self, rng_key = None, mode : LipschitzMode = None):
+        self.optimizer_G = adam(learning_rate=5e-5, b1=0.75, b2=0.999)
+        self.optimizer_D = adam(learning_rate=5e-5, b1=0.75, b2=0.999)
+
+        if type(mode) == GradientPenalty:
+            self.mode = mode
+        else:
+            raise TypeError(f'Unexpected Lipschitz Mode : {type(mode)}')
 
         self.rng = rng_key if rng_key is not None else jax.random.PRNGKey(int(time.time()))
 
@@ -156,8 +173,17 @@ class GANTrainer:
                 'params' : params_D,
         }, fake_batch)
 
+        epsilon = jax.random.uniform(rng_D, shape=(batch.shape[0], 1, 1, 1))
+        interpolated = epsilon * batch + (1 - epsilon) * fake_batch
+
+        # Fetch the gradient lambda_
+        gradients = discriminator_weight_penalty(params_D, interpolated)
+        gradients = jnp.reshape(gradients, (gradients.shape[0], -1))
+        grad_norm = jnp.linalg.norm(gradients, axis=1)
+        grad_penalty = ((grad_norm - 1) ** 2).mean()
+
         # fake - real is done so that we can use a simple gradient descent implementation v/s gradient ascent.
-        return jnp.mean(fake_logits) - jnp.mean(real_logits)
+        return jnp.mean(fake_logits) - jnp.mean(real_logits) + (self.mode.lambda_*grad_penalty)  # type : ignore
 
     def _clip_tree(self, tree, clip):
         return jax.tree_util.tree_map(lambda x: jnp.clip(x, -clip, clip), tree)
@@ -173,8 +199,6 @@ class GANTrainer:
             avg_D_loss += D_loss
             variables_D = variables_D.apply_gradients(grads=grad_D)
 
-            # variables_D.params = self.clip_transform.update(variables_D.params)
-
         avg_D_loss /= n_critic
 
         (G_loss, mutables), grad_G = jax.value_and_grad(self.loss_generator, has_aux=True)(
@@ -182,29 +206,6 @@ class GANTrainer:
         )
 
         variables_G = variables_G.apply_gradients(grads=grad_G, batch_stats=mutables['batch_stats'])
-
-        # if self.wandb_run:
-            # histograms = {}
-
-            # for layer, param in self.optimizer_D.target.items():
-                # if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
-                    # for param_name, param_value in param.items():
-                        # histograms[f'Discriminator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
-                # elif type(param) == jnp.DeviceArray:
-                    # histograms[f'Discriminator/{layer}'] = np.array(param)
-                # else:
-                    # print("ERROR : Unknown type for Discriminator parameter:", type(param))
-
-            # for layer, param in self.optimizer_G.target.items():
-                # if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
-                    # for param_name, param_value in param.items():
-                        # histograms[f'Generator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
-                # elif type(param) == jnp.DeviceArray:
-                    # histograms[f'Generator/{layer}'] = np.array(param)
-                # else:
-                    # print("ERROR : Unknown type for Generator parameter:", type(param))
-
-            # self.wandb_run.log(histograms, commit=False)
 
         return variables_G, variables_D, G_loss, avg_D_loss
 
@@ -232,14 +233,14 @@ def make_dataset(folder_path, batch_size):
     return dataset
 
 def main():
-    dataset = make_dataset('./Shoe Images', 420)
+    dataset = make_dataset('./Shoe_Dataset', 512)
 
     print(f"Loaded Dataset of Shape : {len(dataset)}, {dataset[0].shape}")
 
     rng_key = jax.random.PRNGKey(42)
     rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
 
-    trainer = GANTrainer(rng_key=rng_key)
+    trainer = GANTrainer(mode=GradientPenalty(lambda_=10))
 
     variables_G = initialize_train_state(Generator, (1, 1, 1, 64), trainer.optimizer_G, rng_G, training=True)
     variables_D = initialize_train_state(Discriminator, (1, 64, 64, 3), trainer.optimizer_D, rng_D, training=True)
@@ -248,13 +249,13 @@ def main():
 
     run = wandb.init(project='ShoeGAN')
 
-    with tqdm(range(1000)) as progress_bar:
+    with tqdm(range(1000), desc = 'Training') as progress_bar:
         for epoch in progress_bar:
             losses_G, losses_D = [], []
 
             for batch in dataset:
                 variables_G, variables_D, G_loss, D_loss = trainer.train_step(
-                        variables_G, variables_D, batch, n_critic = 1
+                        variables_G, variables_D, batch, n_critic = 3
                 )
 
                 losses_G.append(G_loss)
