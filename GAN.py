@@ -1,6 +1,7 @@
 import os
 from PIL import Image
 from flax import training
+from jax._src.numpy.lax_numpy import gradient
 
 import numpy as np
 
@@ -18,6 +19,8 @@ import time
 import wandb
 from icecream import ic
 from dataclasses import dataclass
+
+from wandb.sdk import wandb_run
 
 class Generator(nn.Module):
     '''
@@ -42,22 +45,28 @@ class Generator(nn.Module):
         x = nn.leaky_relu(x)
         x = nn.Dense(1024)(x)
         x = nn.leaky_relu(x)
-        x = nn.Dense(2048)(x) # (n, 1, 1, 512) -> (n, 1, 1, 2048)
-        x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.leaky_relu(x)
 
-        x = nn.ConvTranspose(features = 64, kernel_size = (4, 4), strides = (1, 1), padding = 'VALID')(x) # (n, 1, 1, 2048) -> (n, 4, 4, 64)
-        x = nn.leaky_relu(x)
+        x = x.reshape((-1, 4, 4, 64))
+
+        # ic(x.shape)
+
         x = nn.ConvTranspose(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 4, 4, 64) -> (n, 8, 8, 32)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.leaky_relu(x)
+        # ic(x.shape)
+
         x = nn.ConvTranspose(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 8, 8, 32) -> (n, 16, 16, 16)
         x = nn.leaky_relu(x)
+        # ic(x.shape)
+
         x = nn.ConvTranspose(features = 8, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 16) -> (n, 32, 32, 3)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.leaky_relu(x)
+        # ic(x.shape)
+
         x = nn.ConvTranspose(features = 3, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 3) -> (n, 64, 64, 3)
         x = nn.tanh(x)
+        # ic(x.shape)
 
         return x
 
@@ -87,6 +96,13 @@ class Discriminator(nn.Module):
         x = nn.Dense(1024)(x)
         x = nn.leaky_relu(x)
 
+        # x = nn.Dropout(rate = 0.3, deterministic = not self.training)(x)
+
+        x = nn.Dense(512)(x)
+        x = nn.leaky_relu(x)
+
+        # x = nn.Dropout(rate = 0.3, deterministic = not self.training)(x)
+
         x = nn.Dense(256)(x)
         x = nn.leaky_relu(x)
 
@@ -102,7 +118,9 @@ class BatchNormTrainState(train_state.TrainState):
 
 def initialize_train_state(model_type, input_shape, tx, rng_key, **kwargs):
     model = model_type(**kwargs)
-    variables = model.init(rng_key, jnp.ones(input_shape))
+    rng_keys = jax.random.split(rng_key, 2)
+    init_rngs = {'params' : rng_keys[0], 'dropout' : rng_keys[1]}
+    variables = model.init(init_rngs, jnp.ones(input_shape))
 
     return BatchNormTrainState.create(
             apply_fn = model.apply,
@@ -128,9 +146,9 @@ def discriminator_forward(params_D, image):
 discriminator_weight_penalty = jax.vmap(jax.grad(discriminator_forward, argnums = 1), in_axes=(None, 0))
 
 class GANTrainer:
-    def __init__(self, rng_key = None, mode : LipschitzMode = None):
-        self.optimizer_G = adam(learning_rate=1e-3, b1=0.75, b2=0.999)
-        self.optimizer_D = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
+    def __init__(self, rng_key = None, mode : LipschitzMode = None, wandb_run = None):
+        self.optimizer_G = adam(learning_rate=1e-4, b1=0.75, b2=0.999)
+        self.optimizer_D = adam(learning_rate=1e-5, b1=0.75, b2=0.999)
 
         if type(mode) == GradientPenalty:
             self.mode = mode
@@ -138,6 +156,7 @@ class GANTrainer:
             raise TypeError(f'Unexpected Lipschitz Mode : {type(mode)}')
 
         self.rng = rng_key if rng_key is not None else jax.random.PRNGKey(int(time.time()))
+        self.wandb_run = wandb_run
 
     def loss_generator(self, params_G, params_D, batch, variables_G, variables_D):
         self.rng, rng_G = jax.random.split(self.rng, 2)
@@ -183,8 +202,18 @@ class GANTrainer:
         # fake - real is done so that we can use a simple gradient descent implementation v/s gradient ascent.
         return jnp.mean(fake_logits) - jnp.mean(real_logits) + (self.mode.lambda_*grad_penalty)  # type : ignore
 
-    def _clip_tree(self, tree, clip):
-        return jax.tree_util.tree_map(lambda x: jnp.clip(x, -clip, clip), tree)
+    def _log_gradients(self, gradients, prefix = ''):
+        if self.wandb_run is None:
+            return
+
+        wandb_dict = {}
+
+        for layer, layer_vals in gradients.items():
+            for name, val in layer_vals.items():
+                wandb_dict[f'{prefix}/{layer}:{name}'] = wandb.Histogram(val)
+
+        self.wandb_run.log(wandb_dict)
+
 
     def train_step(self, variables_G, variables_D, batch, n_critic):
         avg_D_loss = 0
@@ -204,6 +233,10 @@ class GANTrainer:
         )
 
         variables_G = variables_G.apply_gradients(grads=grad_G, batch_stats=mutables['batch_stats'])
+
+        if self.wandb_run:
+            self._log_gradients(grad_D, prefix='Discriminator')     # type : ignore
+            self._log_gradients(grad_G, prefix='Generator')
 
         return variables_G, variables_D, G_loss, avg_D_loss
 
@@ -231,23 +264,25 @@ def make_dataset(folder_path, batch_size):
     return dataset
 
 def main():
-    dataset = make_dataset('./Shoe Images', 420)
+    dataset = make_dataset('./Shoe Images', 280)
 
     print(f"Loaded Dataset of Shape : {len(dataset)}, {dataset[0].shape}")
 
     rng_key = jax.random.PRNGKey(42)
     rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
 
-    trainer = GANTrainer(mode=GradientPenalty(lambda_=50))
+    run = wandb.init(project='ShoeGAN', mode='disabled')
+
+    trainer = GANTrainer(mode=GradientPenalty(lambda_=15), wandb_run=run)
 
     variables_G = initialize_train_state(Generator, (1, 1, 1, 64), trainer.optimizer_G, rng_G, training=True)
     variables_D = initialize_train_state(Discriminator, (1, 64, 64, 3), trainer.optimizer_D, rng_D, training=True)
 
+    # exit(1)
+
     test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
 
-    run = wandb.init(project='ShoeGAN')
-
-    with tqdm(range(500), desc = 'Training') as progress_bar:
+    with tqdm(range(5000), desc = 'Training') as progress_bar:
         for epoch in progress_bar:
             losses_G, losses_D = [], []
 
