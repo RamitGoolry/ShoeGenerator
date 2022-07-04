@@ -212,7 +212,7 @@ class GANTrainer:
             for name, val in layer_vals.items():
                 wandb_dict[f'{prefix}/{layer}:{name}'] = wandb.Histogram(val)
 
-        self.wandb_run.log(wandb_dict)
+        self.wandb_run.log(wandb_dict, commit=False)
 
 
     def train_step(self, variables_G, variables_D, batch, n_critic):
@@ -271,7 +271,7 @@ def main():
     rng_key = jax.random.PRNGKey(42)
     rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
 
-    run = wandb.init(project='ShoeGAN', mode='disabled')
+    run = wandb.init(project='ShoeGAN')
 
     trainer = GANTrainer(mode=GradientPenalty(lambda_=15), wandb_run=run)
 
