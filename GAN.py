@@ -34,30 +34,28 @@ class Generator(nn.Module):
             (n, 64, 64, 3) image
         '''
         x = nn.Dense(128)(z)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
         x = nn.Dense(256)(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
         x = nn.Dense(512)(z) # (n, 1, 1, 64) -> (n, 1, 1, 512)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
         x = nn.Dense(1024)(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
         x = nn.Dense(2048)(x) # (n, 1, 1, 512) -> (n, 1, 1, 2048)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
 
         x = nn.ConvTranspose(features = 64, kernel_size = (4, 4), strides = (1, 1), padding = 'VALID')(x) # (n, 1, 1, 2048) -> (n, 4, 4, 64)
-        x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
         x = nn.ConvTranspose(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 4, 4, 64) -> (n, 8, 8, 32)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
         x = nn.ConvTranspose(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 8, 8, 32) -> (n, 16, 16, 16)
-        x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
         x = nn.ConvTranspose(features = 8, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 16) -> (n, 32, 32, 3)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
         x = nn.ConvTranspose(features = 3, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 3) -> (n, 64, 64, 3)
         x = nn.tanh(x)
 
@@ -131,8 +129,8 @@ discriminator_weight_penalty = jax.vmap(jax.grad(discriminator_forward, argnums 
 
 class GANTrainer:
     def __init__(self, rng_key = None, mode : LipschitzMode = None):
-        self.optimizer_G = adam(learning_rate=5e-5, b1=0.75, b2=0.999)
-        self.optimizer_D = adam(learning_rate=5e-5, b1=0.75, b2=0.999)
+        self.optimizer_G = adam(learning_rate=1e-3, b1=0.75, b2=0.999)
+        self.optimizer_D = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
 
         if type(mode) == GradientPenalty:
             self.mode = mode
@@ -233,14 +231,14 @@ def make_dataset(folder_path, batch_size):
     return dataset
 
 def main():
-    dataset = make_dataset('./Shoe_Dataset', 512)
+    dataset = make_dataset('./Shoe Images', 420)
 
     print(f"Loaded Dataset of Shape : {len(dataset)}, {dataset[0].shape}")
 
     rng_key = jax.random.PRNGKey(42)
     rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
 
-    trainer = GANTrainer(mode=GradientPenalty(lambda_=10))
+    trainer = GANTrainer(mode=GradientPenalty(lambda_=50))
 
     variables_G = initialize_train_state(Generator, (1, 1, 1, 64), trainer.optimizer_G, rng_G, training=True)
     variables_D = initialize_train_state(Discriminator, (1, 64, 64, 3), trainer.optimizer_D, rng_D, training=True)
@@ -249,7 +247,7 @@ def main():
 
     run = wandb.init(project='ShoeGAN')
 
-    with tqdm(range(1000), desc = 'Training') as progress_bar:
+    with tqdm(range(500), desc = 'Training') as progress_bar:
         for epoch in progress_bar:
             losses_G, losses_D = [], []
 
