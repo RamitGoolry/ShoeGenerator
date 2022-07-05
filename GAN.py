@@ -1,6 +1,5 @@
 import os
 from PIL import Image
-from flax import training
 
 import numpy as np
 
@@ -17,6 +16,10 @@ from tqdm import tqdm
 import time
 import wandb
 from icecream import ic
+from dataclasses import dataclass
+
+def skip_connection(layer, x):
+    return x + layer(x)
 
 class Generator(nn.Module):
     '''
@@ -33,32 +36,57 @@ class Generator(nn.Module):
             (n, 64, 64, 3) image
         '''
         x = nn.Dense(128)(z)
-        x = nn.relu(x)
-        x = nn.Dense(256)(x)
-        x = nn.relu(x)
-        x = nn.Dense(512)(z) # (n, 1, 1, 64) -> (n, 1, 1, 512)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
-        x = nn.Dense(1024)(x)
-        x = nn.relu(x)
-        x = nn.Dense(2048)(x) # (n, 1, 1, 512) -> (n, 1, 1, 2048)
-        x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
 
-        x = nn.ConvTranspose(features = 64, kernel_size = (4, 4), strides = (1, 1), padding = 'VALID')(x) # (n, 1, 1, 2048) -> (n, 4, 4, 64)
+        x = nn.Dense(256)(x)
+        x = nn.leaky_relu(x)
+
+        x = nn.Dense(512)(z)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
-        x = nn.ConvTranspose(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 4, 4, 64) -> (n, 8, 8, 32)
+        x = nn.leaky_relu(x)
+
+        x = nn.Dense(1024)(x)
+        x = nn.leaky_relu(x)
+        # Shape : (n, 1, 1, 1024)
+
+        x = x.reshape((-1, 4, 4, 64))
+        # Shape : (n, 4, 4, 64)
+
+        x = nn.ConvTranspose(features = 64, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(x)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
-        x = nn.ConvTranspose(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 8, 8, 32) -> (n, 16, 16, 16)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 64, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
+        x = nn.leaky_relu(x)
+        # Shape : (n, 4, 4, 64)
+
+        x = nn.ConvTranspose(features = 32, kernel_size = (3, 3), strides = (2, 2), padding = 'SAME')(x)
+        x = nn.leaky_relu(x)
+        # Shape : (n, 8, 8, 32)
+
+        x = nn.ConvTranspose(features = 16, kernel_size = (3, 3), strides = (2, 2), padding = 'SAME')(x)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
-        x = nn.ConvTranspose(features = 8, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 16) -> (n, 32, 32, 3)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 16, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
+        x = nn.leaky_relu(x)
+        # Shape : (n, 16, 16, 16)
+
+        x = nn.ConvTranspose(features = 8, kernel_size = (3, 3), strides = (2, 2), padding = 'SAME')(x)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 8, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 8, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
+        x = nn.leaky_relu(x)
+        # Shape : (n, 32, 32, 8)
+
+        x = nn.ConvTranspose(features = 3, kernel_size = (3, 3), strides = (2, 2), padding = 'SAME')(x)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
-        x = nn.relu(x)
-        x = nn.ConvTranspose(features = 3, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 3) -> (n, 64, 64, 3)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 3, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 3, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
         x = nn.tanh(x)
+        # Shape : (n, 64, 64, 3)
 
         return x
 
@@ -74,21 +102,50 @@ class Discriminator(nn.Module):
         '''
         x: (n, 64, 64, 3) image
         '''
-        x = nn.Conv(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(image) # (n, 64, 64, 3) -> (n, 32, 32, 16)
+
+        # ic(image.shape)
+
+        x = nn.Conv(features = 16, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(image)
         x = nn.leaky_relu(x)
-        x = nn.Conv(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+        # ic(x.shape)
+
+        x = nn.Conv(features = 32, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(x) # (n, 16, 16, 16) -> (n, 8, 8, 32)
         x = nn.leaky_relu(x)
-        x = nn.Conv(features = 64, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2)) # (n, 8, 8, 32) -> (n, 4, 4, 32)
+        # ic(x.shape)
+
+        x = nn.Conv(features = 64, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
         x = nn.leaky_relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2)) # (n, 8, 8, 64) -> (n, 4, 4, 64)
+        # ic(x.shape)
+
+        x = nn.Conv(features = 128, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(x) # (n, 16, 16, 64) -> (n, 8, 8, 128)
+        x = nn.leaky_relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2)) # (n, 8, 8, 128) -> (n, 4, 4, 128)
+        # ic(x.shape)
 
         # Flatten the image
         x = x.reshape((x.shape[0], -1))
         x = nn.Dense(1024)(x)
         x = nn.leaky_relu(x)
+
+        # x = nn.Dropout(rate = 0.3, deterministic = not self.training)(x)
+
+        x = nn.Dense(512)(x)
+        x = nn.leaky_relu(x)
+
+        # x = nn.Dropout(rate = 0.3, deterministic = not self.training)(x)
+
         x = nn.Dense(256)(x)
         x = nn.leaky_relu(x)
+
         x = nn.Dense(64)(x)
         x = nn.leaky_relu(x)
+
+        x = nn.Dense(16)(x)
+        x = nn.leaky_relu(x)
+
         x = nn.Dense(1)(x)
 
         return x
@@ -98,7 +155,9 @@ class BatchNormTrainState(train_state.TrainState):
 
 def initialize_train_state(model_type, input_shape, tx, rng_key, **kwargs):
     model = model_type(**kwargs)
-    variables = model.init(rng_key, jnp.ones(input_shape))
+    rng_keys = jax.random.split(rng_key, 2)
+    init_rngs = {'params' : rng_keys[0], 'dropout' : rng_keys[1]}
+    variables = model.init(init_rngs, jnp.ones(input_shape))
 
     return BatchNormTrainState.create(
             apply_fn = model.apply,
@@ -107,18 +166,40 @@ def initialize_train_state(model_type, input_shape, tx, rng_key, **kwargs):
             batch_stats = variables.get('batch_stats')
     )
 
-@jax.vmap
-def bce_logits_loss(logit, label):
-    return jnp.maximum(logit, 0) - logit * label + jnp.log(1 + jnp.exp(-jnp.abs(logit)))
+class LipschitzMode:
+    pass
+
+@dataclass
+class GradientPenalty(LipschitzMode):
+    lambda_ : float
+
+def discriminator_forward(params_D, image):
+    if len(image.shape) == 3:
+        image = image.reshape((1, *image.shape))
+    return Discriminator(training = True).apply({
+        'params': params_D,
+    }, image)[0][0]
+
+discriminator_weight_penalty = jax.vmap(jax.grad(discriminator_forward, argnums = 1), in_axes=(None, 0))
 
 class GANTrainer:
-    def __init__(self, rng_key = None, clip = 0.01):
-        self.optimizer_G = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
-        self.optimizer_D = adam(learning_rate=1e-4, b1=0.5, b2=0.999)
+    def __init__(self, rng_key = None, mode : LipschitzMode = None, wandb_run = None, total_steps = None):
+        self.optimizer_G_scheduler = optax.exponential_decay(
+                                        init_value = 1e-3, decay_rate=0.95, end_value=1e-6,
+                                        transition_steps=total_steps, transition_begin=int(total_steps * 0.1),
+                                        staircase=False
+                                    )
 
-        self.clip_transform = optax.clip(max_delta = clip)
+        self.optimizer_G = adam(learning_rate=self.optimizer_G_scheduler, b1=0.75, b2=0.999)
+        self.optimizer_D = adam(learning_rate=5e-5, b1=0.75, b2=0.999)
+
+        if type(mode) == GradientPenalty:
+            self.mode = mode
+        else:
+            raise TypeError(f'Unexpected Lipschitz Mode : {type(mode)}')
 
         self.rng = rng_key if rng_key is not None else jax.random.PRNGKey(int(time.time()))
+        self.wandb_run = wandb_run
 
     def loss_generator(self, params_G, params_D, batch, variables_G, variables_D):
         self.rng, rng_G = jax.random.split(self.rng, 2)
@@ -152,11 +233,30 @@ class GANTrainer:
                 'params' : params_D,
         }, fake_batch)
 
-        # fake - real is done so that we can use a simple gradient descent implementation v/s gradient ascent.
-        return jnp.mean(fake_logits) - jnp.mean(real_logits)
+        epsilon = jax.random.uniform(rng_D, shape=(batch.shape[0], 1, 1, 1))
+        interpolated = epsilon * batch + (1 - epsilon) * fake_batch
 
-    def _clip_tree(self, tree, clip):
-        return jax.tree_util.tree_map(lambda x: jnp.clip(x, -clip, clip), tree)
+        # Fetch the gradient lambda_
+        gradients = discriminator_weight_penalty(params_D, interpolated)
+        gradients = jnp.reshape(gradients, (gradients.shape[0], -1))
+        grad_norm = jnp.linalg.norm(gradients, axis=1)
+        grad_penalty = ((grad_norm - 1) ** 2).mean()
+
+        # fake - real is done so that we can use a simple gradient descent implementation v/s gradient ascent.
+        return jnp.mean(fake_logits) - jnp.mean(real_logits) + (self.mode.lambda_*grad_penalty)  # type : ignore
+
+    def _log_gradients(self, gradients, prefix = ''):
+        if self.wandb_run is None:
+            return
+
+        wandb_dict = {}
+
+        for layer, layer_vals in gradients.items():
+            for name, val in layer_vals.items():
+                wandb_dict[f'{prefix}/{layer}:{name}'] = wandb.Histogram(val)
+
+        self.wandb_run.log(wandb_dict, commit=False)
+
 
     def train_step(self, variables_G, variables_D, batch, n_critic):
         avg_D_loss = 0
@@ -169,8 +269,6 @@ class GANTrainer:
             avg_D_loss += D_loss
             variables_D = variables_D.apply_gradients(grads=grad_D)
 
-            # variables_D.params = self.clip_transform.update(variables_D.params)
-
         avg_D_loss /= n_critic
 
         (G_loss, mutables), grad_G = jax.value_and_grad(self.loss_generator, has_aux=True)(
@@ -179,28 +277,9 @@ class GANTrainer:
 
         variables_G = variables_G.apply_gradients(grads=grad_G, batch_stats=mutables['batch_stats'])
 
-        # if self.wandb_run:
-            # histograms = {}
-
-            # for layer, param in self.optimizer_D.target.items():
-                # if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
-                    # for param_name, param_value in param.items():
-                        # histograms[f'Discriminator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
-                # elif type(param) == jnp.DeviceArray:
-                    # histograms[f'Discriminator/{layer}'] = np.array(param)
-                # else:
-                    # print("ERROR : Unknown type for Discriminator parameter:", type(param))
-
-            # for layer, param in self.optimizer_G.target.items():
-                # if type(param) == dict or type(param) == flax.core.frozen_dict.FrozenDict:
-                    # for param_name, param_value in param.items():
-                        # histograms[f'Generator/{layer}:{param_name}'] = wandb.Histogram(np.array(param_value))
-                # elif type(param) == jnp.DeviceArray:
-                    # histograms[f'Generator/{layer}'] = np.array(param)
-                # else:
-                    # print("ERROR : Unknown type for Generator parameter:", type(param))
-
-            # self.wandb_run.log(histograms, commit=False)
+        if self.wandb_run:
+            self._log_gradients(grad_D, prefix='Discriminator')     # type : ignore
+            self._log_gradients(grad_G, prefix='Generator')
 
         return variables_G, variables_D, G_loss, avg_D_loss
 
@@ -227,6 +306,8 @@ def make_dataset(folder_path, batch_size):
 
     return dataset
 
+EPOCHS = 1000
+
 def main():
     dataset = make_dataset('./Shoe Images', 420)
 
@@ -235,22 +316,25 @@ def main():
     rng_key = jax.random.PRNGKey(42)
     rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
 
-    trainer = GANTrainer(rng_key=rng_key)
+    run = wandb.init(project='ShoeGAN')
+    # run = wandb.init(project='ShoeGAN', mode='disabled')
+
+    trainer = GANTrainer(mode=GradientPenalty(lambda_=15), wandb_run=run, total_steps=len(dataset) * EPOCHS)
 
     variables_G = initialize_train_state(Generator, (1, 1, 1, 64), trainer.optimizer_G, rng_G, training=True)
     variables_D = initialize_train_state(Discriminator, (1, 64, 64, 3), trainer.optimizer_D, rng_D, training=True)
 
+    # exit(1)
+
     test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
 
-    run = wandb.init(project='ShoeGAN')
-
-    with tqdm(range(1000)) as progress_bar:
+    with tqdm(range(EPOCHS), desc = 'Training') as progress_bar:
         for epoch in progress_bar:
             losses_G, losses_D = [], []
 
             for batch in dataset:
                 variables_G, variables_D, G_loss, D_loss = trainer.train_step(
-                        variables_G, variables_D, batch, n_critic = 1
+                        variables_G, variables_D, batch, n_critic = 3
                 )
 
                 losses_G.append(G_loss)
@@ -264,10 +348,14 @@ def main():
                     'batch_stats' : variables_G.batch_stats,
             }, test_latent_dim)
 
+            # ic(variables_G.opt_state[1].hyperparams)
+
+
             wandb_dict = {
                     'Generator Loss' : jnp.mean(jnp.array(losses_G)),
                     'Discriminator Loss' : jnp.mean(jnp.array(losses_D)),
-                    'Prediction' : wandb.Image(np.array(prediction))
+                    'Prediction' : wandb.Image(np.array(prediction)),
+                    # 'Generator Params' : variables_G.opt_state.hyperparams['learning_rate']
             }
 
             run.log(wandb_dict)
