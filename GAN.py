@@ -1,7 +1,5 @@
 import os
 from PIL import Image
-from flax import training
-from jax._src.numpy.lax_numpy import gradient
 
 import numpy as np
 
@@ -20,7 +18,8 @@ import wandb
 from icecream import ic
 from dataclasses import dataclass
 
-from wandb.sdk import wandb_run
+def skip_connection(layer, x):
+    return x + layer(x)
 
 class Generator(nn.Module):
     '''
@@ -37,36 +36,57 @@ class Generator(nn.Module):
             (n, 64, 64, 3) image
         '''
         x = nn.Dense(128)(z)
+        x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.leaky_relu(x)
+
         x = nn.Dense(256)(x)
         x = nn.leaky_relu(x)
-        x = nn.Dense(512)(z) # (n, 1, 1, 64) -> (n, 1, 1, 512)
+
+        x = nn.Dense(512)(z)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.leaky_relu(x)
+
         x = nn.Dense(1024)(x)
         x = nn.leaky_relu(x)
+        # Shape : (n, 1, 1, 1024)
 
         x = x.reshape((-1, 4, 4, 64))
+        # Shape : (n, 4, 4, 64)
 
-        # ic(x.shape)
-
-        x = nn.ConvTranspose(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 4, 4, 64) -> (n, 8, 8, 32)
+        x = nn.ConvTranspose(features = 64, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(x)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.leaky_relu(x)
-        # ic(x.shape)
-
-        x = nn.ConvTranspose(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 8, 8, 32) -> (n, 16, 16, 16)
+        x = skip_connection(nn.ConvTranspose(features = 64, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
         x = nn.leaky_relu(x)
-        # ic(x.shape)
+        # Shape : (n, 4, 4, 64)
 
-        x = nn.ConvTranspose(features = 8, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 16) -> (n, 32, 32, 3)
+        x = nn.ConvTranspose(features = 32, kernel_size = (3, 3), strides = (2, 2), padding = 'SAME')(x)
+        x = nn.leaky_relu(x)
+        # Shape : (n, 8, 8, 32)
+
+        x = nn.ConvTranspose(features = 16, kernel_size = (3, 3), strides = (2, 2), padding = 'SAME')(x)
         x = nn.BatchNorm(use_running_average = not self.training)(x)
         x = nn.leaky_relu(x)
-        # ic(x.shape)
+        x = skip_connection(nn.ConvTranspose(features = 16, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
+        x = nn.leaky_relu(x)
+        # Shape : (n, 16, 16, 16)
 
-        x = nn.ConvTranspose(features = 3, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 3) -> (n, 64, 64, 3)
+        x = nn.ConvTranspose(features = 8, kernel_size = (3, 3), strides = (2, 2), padding = 'SAME')(x)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 8, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 8, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
+        x = nn.leaky_relu(x)
+        # Shape : (n, 32, 32, 8)
+
+        x = nn.ConvTranspose(features = 3, kernel_size = (3, 3), strides = (2, 2), padding = 'SAME')(x)
+        x = nn.BatchNorm(use_running_average = not self.training)(x)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 3, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
+        x = nn.leaky_relu(x)
+        x = skip_connection(nn.ConvTranspose(features = 3, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME'), x)
         x = nn.tanh(x)
-        # ic(x.shape)
+        # Shape : (n, 64, 64, 3)
 
         return x
 
@@ -82,14 +102,28 @@ class Discriminator(nn.Module):
         '''
         x: (n, 64, 64, 3) image
         '''
-        x = nn.Conv(features = 16, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(image) # (n, 64, 64, 3) -> (n, 32, 32, 16)
-        x = nn.leaky_relu(x)
 
-        x = nn.Conv(features = 32, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 32, 32, 16) -> (n, 16, 16, 32)
-        x = nn.leaky_relu(x)
+        # ic(image.shape)
 
-        x = nn.Conv(features = 64, kernel_size = (4, 4), strides = (2, 2), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
+        x = nn.Conv(features = 16, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(image)
         x = nn.leaky_relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+        # ic(x.shape)
+
+        x = nn.Conv(features = 32, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(x) # (n, 16, 16, 16) -> (n, 8, 8, 32)
+        x = nn.leaky_relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2)) # (n, 8, 8, 32) -> (n, 4, 4, 32)
+        # ic(x.shape)
+
+        x = nn.Conv(features = 64, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(x) # (n, 16, 16, 32) -> (n, 8, 8, 64)
+        x = nn.leaky_relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2)) # (n, 8, 8, 64) -> (n, 4, 4, 64)
+        # ic(x.shape)
+
+        x = nn.Conv(features = 128, kernel_size = (3, 3), strides = (1, 1), padding = 'SAME')(x) # (n, 16, 16, 64) -> (n, 8, 8, 128)
+        x = nn.leaky_relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2)) # (n, 8, 8, 128) -> (n, 4, 4, 128)
+        # ic(x.shape)
 
         # Flatten the image
         x = x.reshape((x.shape[0], -1))
@@ -107,6 +141,9 @@ class Discriminator(nn.Module):
         x = nn.leaky_relu(x)
 
         x = nn.Dense(64)(x)
+        x = nn.leaky_relu(x)
+
+        x = nn.Dense(16)(x)
         x = nn.leaky_relu(x)
 
         x = nn.Dense(1)(x)
@@ -146,9 +183,15 @@ def discriminator_forward(params_D, image):
 discriminator_weight_penalty = jax.vmap(jax.grad(discriminator_forward, argnums = 1), in_axes=(None, 0))
 
 class GANTrainer:
-    def __init__(self, rng_key = None, mode : LipschitzMode = None, wandb_run = None):
-        self.optimizer_G = adam(learning_rate=1e-4, b1=0.75, b2=0.999)
-        self.optimizer_D = adam(learning_rate=1e-5, b1=0.75, b2=0.999)
+    def __init__(self, rng_key = None, mode : LipschitzMode = None, wandb_run = None, total_steps = None):
+        self.optimizer_G_scheduler = optax.exponential_decay(
+                                        init_value = 1e-3, decay_rate=0.95, end_value=1e-6,
+                                        transition_steps=total_steps, transition_begin=int(total_steps * 0.1),
+                                        staircase=False
+                                    )
+
+        self.optimizer_G = adam(learning_rate=self.optimizer_G_scheduler, b1=0.75, b2=0.999)
+        self.optimizer_D = adam(learning_rate=5e-5, b1=0.75, b2=0.999)
 
         if type(mode) == GradientPenalty:
             self.mode = mode
@@ -263,8 +306,10 @@ def make_dataset(folder_path, batch_size):
 
     return dataset
 
+EPOCHS = 1000
+
 def main():
-    dataset = make_dataset('./Shoe Images', 280)
+    dataset = make_dataset('./Shoe Images', 420)
 
     print(f"Loaded Dataset of Shape : {len(dataset)}, {dataset[0].shape}")
 
@@ -272,8 +317,9 @@ def main():
     rng_key, rng_G, rng_D = jax.random.split(rng_key, 3)
 
     run = wandb.init(project='ShoeGAN')
+    # run = wandb.init(project='ShoeGAN', mode='disabled')
 
-    trainer = GANTrainer(mode=GradientPenalty(lambda_=15), wandb_run=run)
+    trainer = GANTrainer(mode=GradientPenalty(lambda_=15), wandb_run=run, total_steps=len(dataset) * EPOCHS)
 
     variables_G = initialize_train_state(Generator, (1, 1, 1, 64), trainer.optimizer_G, rng_G, training=True)
     variables_D = initialize_train_state(Discriminator, (1, 64, 64, 3), trainer.optimizer_D, rng_D, training=True)
@@ -282,7 +328,7 @@ def main():
 
     test_latent_dim = jax.random.normal(rng_key, shape=(1, 1, 1, 64))
 
-    with tqdm(range(5000), desc = 'Training') as progress_bar:
+    with tqdm(range(EPOCHS), desc = 'Training') as progress_bar:
         for epoch in progress_bar:
             losses_G, losses_D = [], []
 
@@ -302,10 +348,14 @@ def main():
                     'batch_stats' : variables_G.batch_stats,
             }, test_latent_dim)
 
+            # ic(variables_G.opt_state[1].hyperparams)
+
+
             wandb_dict = {
                     'Generator Loss' : jnp.mean(jnp.array(losses_G)),
                     'Discriminator Loss' : jnp.mean(jnp.array(losses_D)),
-                    'Prediction' : wandb.Image(np.array(prediction))
+                    'Prediction' : wandb.Image(np.array(prediction)),
+                    # 'Generator Params' : variables_G.opt_state.hyperparams['learning_rate']
             }
 
             run.log(wandb_dict)
