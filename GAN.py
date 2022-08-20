@@ -189,9 +189,14 @@ class GANTrainer:
                                         transition_steps=total_steps, transition_begin=int(total_steps * 0.1),
                                         staircase=False
                                     )
+        self.optimizer_D_scheduler = optax.exponential_decay(
+                                        init_value = 1e-4, decay_rate=0.95, end_value=5e-7,
+                                        transition_steps=total_steps, transition_begin=int(total_steps * 0.25),
+                                        staircase=False
+                                    )
 
-        self.optimizer_G = adam(learning_rate=self.optimizer_G_scheduler, b1=0.75, b2=0.999)
-        self.optimizer_D = adam(learning_rate=5e-5, b1=0.75, b2=0.999)
+        self.optimizer_G = adam(learning_rate=self.optimizer_G_scheduler, b1=0.9, b2=0.999)
+        self.optimizer_D = adam(learning_rate=self.optimizer_D_scheduler, b1=0.9, b2=0.999)
 
         if type(mode) == GradientPenalty:
             self.mode = mode
